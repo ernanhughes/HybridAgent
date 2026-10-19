@@ -127,6 +127,11 @@ class HybridGenerationEngine:
         self.tool_workers = int(tool_workers)
 
         self.embed_layer = self.backbone.get_input_embeddings()
+        # Prefer the embedding device for engine tensors (supports CPU/GPU offloading).
+        try:
+            self.device = self.embed_layer.weight.device
+        except Exception:
+            pass
         self.latent_open_id = special_token_id(tokenizer, ENTRY_ANCHOR)
         self.latent_close_id = special_token_id(tokenizer, EXIT_ANCHOR)
         self.think_open_id = special_token_id(tokenizer, THINK_OPEN)

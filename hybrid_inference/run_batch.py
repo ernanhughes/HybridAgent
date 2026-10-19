@@ -5,23 +5,36 @@ the extracted answer, the latent-span readouts and tool-call statistics.
 
   python -m hybrid_inference.run_batch --model <checkpoint dir or HF id> \
       --input examples/questions.jsonl --output outputs/results.jsonl --num_samples 4
+
+OpenCode text provider:
+
+  python -m hybrid_inference.run_batch --provider opencode --model <model-id> \
+      --input examples/questions.jsonl --output outputs/opencode-results.jsonl
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 
-import torch
-
-from hybrid_agent import HybridGenerationEngine, SYSTEM_PROMPT, build_tool_executor, extract_answer, load_hybrid_agent
+from hybrid_agent.providers import (
+    create_provider,
+    load_config,
+)
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="HybridAgent batch inference")
-    p.add_argument("--model", required=True, help="HybridAgent checkpoint: local dir or HF model id")
+    p.add_argument("--provider", default="native", help="provider: native or opencode")
+    p.add_argument("--config", default=None, help="path to provider config file")
+    p.add_argument("--model", default=None, help="model id or checkpoint (required for native)")
+    p.add_argument("--base-url", default=None, help="override OpenCode base URL")
+    p.add_argument("--timeout", type=float, default=None, help="override timeout seconds")
+    p.add_argument("--max-retries", type=int, default=None, help="override max retries")
     p.add_argument("--input", required=True, help="JSONL with one {\"id\", \"question\"} per line")
     p.add_argument("--output", required=True, help="JSONL output (appended; see --resume)")
     p.add_argument("--num_samples", type=int, default=1, help="samples per question")
@@ -49,6 +62,10 @@ def parse_args(argv=None):
     p.add_argument("--num_shards", type=int, default=None, help="total shards (default: WORLD_SIZE env)")
     p.add_argument("--resume", action="store_true", help="skip (id, sample) pairs already in --output")
     p.add_argument("--limit", type=int, default=0, help="stop after this many questions (0 = all)")
+    p.add_argument("--dry-run", action="store_true", help="do not contact the API; write dry-run records")
+    p.add_argument("--check-config", action="store_true", help="print provider configuration and exit")
+    p.add_argument("--max-requests", type=int, default=None, help="override execution max_requests")
+    p.add_argument("--max-cost-usd", type=float, default=None, help="override execution max_cost_usd")
     args = p.parse_args(argv)
     if args.batch_size is None:
         args.batch_size = args.num_samples
@@ -60,7 +77,7 @@ def parse_args(argv=None):
 
 
 def read_questions(path: str) -> list[dict]:
-    questions = []
+    questions: list[dict] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -87,8 +104,157 @@ def read_done(path: str) -> set[tuple]:
     return done
 
 
-def main(argv=None) -> None:
-    args = parse_args(argv)
+def _load_provider_config(args):
+    cfg = load_config(args.config)
+    cfg.provider = args.provider
+    if args.provider in ("opencode", "opencode-go"):
+        if args.model:
+            cfg.opencode.model = args.model
+        if args.base_url:
+            cfg.opencode.base_url = args.base_url
+        if args.timeout is not None:
+            cfg.opencode.timeout_seconds = args.timeout
+        if args.max_retries is not None:
+            cfg.opencode.max_retries = args.max_retries
+    else:
+        if args.model:
+            cfg.native_hybrid.model = args.model
+            cfg.native_hybrid.enabled = True
+    if args.max_requests is not None:
+        cfg.execution.max_requests = args.max_requests
+    if args.max_cost_usd is not None:
+        cfg.execution.max_cost_usd = args.max_cost_usd
+    if args.dry_run:
+        cfg.execution.dry_run = True
+    cfg.validate()
+    return cfg
+
+
+def _run_opencode(args) -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+    cfg = _load_provider_config(args)
+    provider = create_provider(cfg)
+
+    if args.check_config:
+        import pprint
+
+        pprint.pprint(provider.check_config())
+        return
+
+    questions: list[dict] = read_questions(args.input)
+    if args.limit:
+        questions = questions[: args.limit]
+    mine = [(i, q) for i, q in enumerate(questions) if i % args.num_shards == args.shard_id]
+    done = read_done(args.output) if args.resume else set()
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
+    run_id = str(uuid.uuid4())
+    request_count = 0
+    max_requests = cfg.execution.max_requests
+    # max_cost = cfg.execution.max_cost_usd  # cost enforcement not implemented (unknown pricing)
+
+    print(f"[shard {args.shard_id}/{args.num_shards}] provider=opencode model={cfg.opencode.model} "
+          f"{len(mine)} questions x {args.num_samples} samples -> {args.output}", flush=True)
+
+    with open(args.output, "a", encoding="utf-8") as out:
+        for q_index, rec in mine:
+            pending = [s for s in range(args.num_samples) if (rec["id"], s) not in done]
+            if not pending:
+                continue
+            qhash = hashlib.sha256(rec["question"].encode("utf-8")).hexdigest()
+            meta = {k: v for k, v in rec.items() if k not in ("id", "question")}
+            for sample_idx in pending:
+                if request_count >= max_requests:
+                    print("request budget exhausted; stopping", flush=True)
+                    return
+                record = {
+                    "run_id": run_id,
+                    "id": rec["id"],
+                    "sample_idx": sample_idx,
+                    "question": rec["question"],
+                    "input_hash": qhash,
+                    "provider": provider.provider_id,
+                    "model": cfg.opencode.model,
+                    "execution_mode": "TEXT_API",
+                    "capability_flags": provider.capabilities.to_dict() if hasattr(provider.capabilities, "to_dict") else provider.capabilities.as_set() if hasattr(provider.capabilities, "as_set") else {},
+                    "meta": meta if meta else None,
+                }
+                if cfg.execution.dry_run:
+                    record.update({
+                        "status": "dry_run",
+                        "response": None,
+                        "raw_response": None,
+                        "usage": None,
+                        "latency_s": 0.0,
+                        "error": None,
+                    })
+                else:
+                    from hybrid_agent.providers.base import ProviderRequest
+
+                    messages = [{"role": "user", "content": rec["question"]}]
+                    req = ProviderRequest(
+                        messages=messages,
+                        model=cfg.opencode.model,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        max_tokens=args.max_response_tokens,
+                    )
+                    t0 = time.time()
+                    try:
+                        resp = provider.generate(req)
+                        record.update({
+                            "status": "ok",
+                            "response": resp.text,
+                            "raw_response": resp.raw if cfg.execution.preserve_raw else None,
+                            "usage": resp.usage.to_dict() if resp.usage else None,
+                            "latency_s": resp.latency_s,
+                            "model_reported": resp.model,
+                            "request_id": resp.request_id,
+                            "error": None,
+                        })
+                    except Exception as exc:
+                        record.update({
+                            "status": "error",
+                            "response": None,
+                            "raw_response": None,
+                            "usage": None,
+                            "latency_s": round(time.time() - t0, 4),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+                request_count += 1
+                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+                status = record.get('status')
+                msg = f"[shard {args.shard_id}] question {rec['id']} sample {sample_idx}: {status}"
+                if status == 'error':
+                    msg += f" - {record.get('error')}"
+                print(msg, flush=True)
+
+    provider.close()
+
+
+def _run_native(args) -> None:
+    import torch
+
+    from hybrid_agent import (
+        HybridGenerationEngine,
+        SYSTEM_PROMPT,
+        build_tool_executor,
+        extract_answer,
+        load_hybrid_agent,
+    )
+
+    args_model = args.model
+    if not args_model:
+        raise SystemExit("--model is required for native provider")
+
     try:
         from dotenv import load_dotenv
 
@@ -98,10 +264,10 @@ def main(argv=None) -> None:
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    model, tokenizer = load_hybrid_agent(args.model, device=device)
+    model, tokenizer = load_hybrid_agent(args_model, device=device)
     tools = build_tool_executor(args.python_timeout, args.search_max_results, args.search_result_length)
 
-    questions = read_questions(args.input)
+    questions: list[dict] = read_questions(args.input)
     if args.limit:
         questions = questions[: args.limit]
     mine = [(i, q) for i, q in enumerate(questions) if i % args.num_shards == args.shard_id]
@@ -116,7 +282,7 @@ def main(argv=None) -> None:
                 continue
             meta = {k: v for k, v in rec.items() if k not in ("id", "question")}
             for start in range(0, len(pending), args.batch_size):
-                sample_ids = pending[start : start + args.batch_size]
+                sample_ids = pending[start: start + args.batch_size]
                 engine = HybridGenerationEngine(
                     model, tokenizer, device, tools, SYSTEM_PROMPT, rec["question"],
                     batch_size=len(sample_ids),
@@ -159,12 +325,22 @@ def main(argv=None) -> None:
                         "latent_spans": result["latent_spans"],
                         "end_reason": result["end_reason"],
                         "wall_time_s": round(wall, 2),
+                        "execution_mode": "NATIVE_HYBRID",
+                        "provider": "native_hybrid",
                     }
                     out.write(json.dumps(record, ensure_ascii=False) + "\n")
                 out.flush()
                 os.fsync(out.fileno())
                 print(f"[shard {args.shard_id}] question {rec['id']}: {len(sample_ids)} samples in {wall:.0f}s "
                       f"(latent steps {sum(engine.row_result(r)['latent_steps'] for r in engine.rows)})", flush=True)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    if args.provider in ("opencode", "opencode-go"):
+        _run_opencode(args)
+    else:
+        _run_native(args)
 
 
 if __name__ == "__main__":

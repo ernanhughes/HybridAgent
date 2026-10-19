@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from typing import Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .constants import ANCHOR_TOKENS
@@ -53,16 +54,43 @@ class HybridAgentModel(nn.Module):
         cls,
         path_or_repo: str | os.PathLike,
         *,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: Any = torch.bfloat16,
         trust_remote_code: bool = False,
         require_hybridlink: bool = False,
         revision: str | None = None,
+        device: str | torch.device | None = None,
+        device_map: Any = None,
+        max_memory: dict | None = None,
+        offload_folder: str | os.PathLike | None = None,
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
+        low_cpu_mem_usage: bool | None = None,
     ) -> "HybridAgentModel":
         """Load the backbone and, when present, the HybridLink weights of a checkpoint."""
         local = resolve_model_dir(path_or_repo, revision)
-        backbone = AutoModelForCausalLM.from_pretrained(
-            str(local), dtype=dtype, trust_remote_code=trust_remote_code
-        )
+        if isinstance(dtype, str):
+            dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16,
+                    "float32": torch.float32, "fp16": torch.float16,
+                    "bf16": torch.bfloat16, "fp32": torch.float32}.get(dtype.lower(), torch.bfloat16)
+        if dtype is None:
+            dtype = torch.bfloat16
+        kwargs = {"dtype": dtype, "trust_remote_code": trust_remote_code}
+        if device_map is not None:
+            kwargs["device_map"] = device_map
+            kwargs["low_cpu_mem_usage"] = True if low_cpu_mem_usage is None else low_cpu_mem_usage
+        if max_memory is not None:
+            kwargs["max_memory"] = max_memory
+        if offload_folder is not None:
+            kwargs["offload_folder"] = str(offload_folder)
+        if load_in_8bit:
+            kwargs["load_in_8bit"] = True
+            kwargs["device_map"] = device_map if device_map is not None else "auto"
+        if load_in_4bit:
+            kwargs["load_in_4bit"] = True
+            kwargs["device_map"] = device_map if device_map is not None else "auto"
+        if low_cpu_mem_usage is not None and device_map is None and not load_in_8bit and not load_in_4bit:
+            kwargs["low_cpu_mem_usage"] = low_cpu_mem_usage
+        backbone = AutoModelForCausalLM.from_pretrained(str(local), **kwargs)
         model = cls(backbone)
         weights = local / HYBRIDLINK_WEIGHTS
         if weights.is_file():
@@ -75,18 +103,28 @@ class HybridAgentModel(nn.Module):
             model.hybridlink.load_state_dict(state, strict=True)
         elif require_hybridlink:
             raise FileNotFoundError(f"{HYBRIDLINK_WEIGHTS} not found in {local}")
+        # Align HybridLink with the (possibly sharded) embedding device.
+        try:
+            embed_device = model.backbone.get_input_embeddings().weight.device
+            model.hybridlink.to(device=embed_device)
+        except Exception:
+            pass
+        if device is not None and device_map is None and not load_in_8bit and not load_in_4bit:
+            model.to(device)
         return model
 
     def run_hybridlink(
         self, hidden_states: torch.Tensor, output_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
         """R(h): next-step latent inputs from last-layer hidden states."""
+        link_device = next(self.hybridlink.parameters()).device
         link_dtype = next(self.hybridlink.parameters()).dtype
-        x = hidden_states if hidden_states.dtype == link_dtype else hidden_states.to(link_dtype)
+        x = hidden_states.to(device=link_device, dtype=link_dtype)
         out = self.hybridlink(x)
         if output_dtype is not None and out.dtype != output_dtype:
             out = out.to(output_dtype)
-        return out
+        # Return on the hidden-state device so downstream engine tensors stay aligned.
+        return out.to(device=hidden_states.device)
 
     def resize_to_tokenizer(self, tokenizer) -> None:
         """Match the embedding table to the tokenizer (needed once for a fresh base model)."""
@@ -111,11 +149,17 @@ class HybridAgentModel(nn.Module):
 def load_hybrid_agent(
     path_or_repo: str | os.PathLike,
     *,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: Any = torch.bfloat16,
     device: str | torch.device | None = None,
     trust_remote_code: bool = False,
     require_hybridlink: bool = True,
     revision: str | None = None,
+    device_map: Any = None,
+    max_memory: dict | None = None,
+    offload_folder: str | os.PathLike | None = None,
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
+    low_cpu_mem_usage: bool | None = None,
 ):
     """Return `(model, tokenizer)` ready for generation from a local dir or HF repo id."""
     local = resolve_model_dir(path_or_repo, revision)
@@ -127,9 +171,12 @@ def load_hybrid_agent(
     model = HybridAgentModel.from_pretrained(
         local, dtype=dtype, trust_remote_code=trust_remote_code,
         require_hybridlink=require_hybridlink, revision=revision,
+        device=device, device_map=device_map, max_memory=max_memory,
+        offload_folder=offload_folder, load_in_8bit=load_in_8bit,
+        load_in_4bit=load_in_4bit, low_cpu_mem_usage=low_cpu_mem_usage,
     )
     model.resize_to_tokenizer(tokenizer)
-    if device is not None:
+    if device is not None and device_map is None and not load_in_8bit and not load_in_4bit:
         model.to(device)
     model.eval()
     return model, tokenizer

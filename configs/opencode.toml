@@ -1,0 +1,22 @@
+# OpenCode hosted inference provider configuration
+provider = "opencode"
+
+[opencode]
+api_family = "openai-chat"
+base_url = "https://opencode.ai/inference/openai/v1"
+model = ""
+api_key_env = "OPENCODE_API_KEY"
+timeout_seconds = 120
+max_retries = 2
+supports_structured_output = false
+supports_tool_calls = false
+
+[native_hybrid]
+enabled = false
+model = ""
+
+[execution]
+preserve_raw = true
+dry_run = false
+max_requests = 100
+max_cost_usd = 2.00
